@@ -1,5 +1,6 @@
 const { Client } = require('pg');
 const fs = require('fs').promises;
+const fsSync = require('fs');
 const path = require('path');
 
 const client = new Client({
@@ -11,6 +12,66 @@ const client = new Client({
 });
 
 const LAST_ID_FILE = path.join(__dirname, 'lastId.txt');
+const LOG_FILE = path.join(__dirname, 'migration.log');
+
+// Logging utility
+class Logger {
+  constructor(logFile) {
+    this.logFile = logFile;
+    this.logStream = null;
+  }
+
+  initialize() {
+    try {
+      // Open log file in append mode
+      this.logStream = fsSync.createWriteStream(this.logFile, { flags: 'a' });
+      this.log('=== Migration started ===');
+    } catch (error) {
+      // Fallback to console if file logging fails
+      console.error('Failed to initialize log file:', error.message);
+    }
+  }
+
+  getTimestamp() {
+    return new Date().toISOString();
+  }
+
+  log(message) {
+    const timestamp = this.getTimestamp();
+    const logMessage = `[${timestamp}] ${message}\n`;
+    
+    try {
+      if (this.logStream) {
+        this.logStream.write(logMessage);
+      } else {
+        // Fallback to console if stream not initialized
+        console.log(message);
+      }
+    } catch (error) {
+      // Fallback to console on error
+      console.error('Logging error:', error.message);
+      console.log(message);
+    }
+  }
+
+  error(message, error = null) {
+    const errorMessage = error ? `${message}: ${error.message || error}` : message;
+    this.log(`ERROR: ${errorMessage}`);
+  }
+
+  close() {
+    try {
+      if (this.logStream) {
+        this.log('=== Migration ended ===\n');
+        this.logStream.end();
+      }
+    } catch (error) {
+      console.error('Error closing log file:', error.message);
+    }
+  }
+}
+
+const logger = new Logger(LOG_FILE);
 
 async function loadLastId() {
   try {
@@ -27,42 +88,42 @@ async function saveLastId(lastId) {
   try {
     await fs.writeFile(LAST_ID_FILE, lastId, 'utf8');
   } catch (error) {
-    console.error(`Warning: Could not save lastId to file: ${error.message}`);
+    logger.error(`Warning: Could not save lastId to file`, error);
   }
 }
 
 async function batchUpdate() {
   try {
+    logger.initialize();
     await client.connect();
-    console.log('Connected to database');
+    logger.log('Connected to database');
 
     // Load lastId from file or start from null
     let lastId = await loadLastId();
     if (lastId) {
-      console.log(`Resuming from lastId: ${lastId}`);
+      logger.log(`Resuming from lastId: ${lastId}`);
     }
 
     let totalUpdated = 0;
+    let totalInserted = 0;
     let batchNumber = 1;
     const batchSize = 1000;
 
     while (true) {
-      // Select rows that need updating with cursor-based paging
-      // Handle UUID comparison - PostgreSQL can compare UUIDs directly
+      // Select rows from dictionary_v2 with cursor-based paging
+      // We'll process all words from dictionary_v2
       const selectQuery = lastId
         ? `
-          SELECT d.id
-          FROM dictionary d
-          WHERE d.relations IS NULL
-            AND d.id > $1::uuid
-          ORDER BY d.id
+          SELECT d2.id, d2.word, d2.meaning, d2.relations
+          FROM dictionary_v2 d2
+          WHERE d2.id > $1::uuid
+          ORDER BY d2.id
           LIMIT $2
         `
         : `
-          SELECT d.id
-          FROM dictionary d
-          WHERE d.relations IS NULL
-          ORDER BY d.id
+          SELECT d2.id, d2.word, d2.meaning, d2.relations
+          FROM dictionary_v2 d2
+          ORDER BY d2.id
           LIMIT $1
         `;
 
@@ -71,42 +132,68 @@ async function batchUpdate() {
         : await client.query(selectQuery, [batchSize]);
 
       if (result.rows.length === 0) {
-        console.log('\nNo more rows to update. Process complete!');
+        logger.log('No more rows to process. Process complete!');
         break;
       }
 
-      console.log(`\nBatch ${batchNumber}: Processing ${result.rows.length} rows...`);
+      logger.log(`Batch ${batchNumber}: Processing ${result.rows.length} rows...`);
 
-      // Update all rows in this batch with a single query
-      const ids = result.rows.map(row => row.id);
-      const placeholders = ids.map((_, i) => `$${i + 1}`).join(', ');
-      
-      const updateQuery = `
-        UPDATE dictionary d
-        SET relations = (
-          SELECT d2.relations 
-          FROM dictionary_v2 d2 
-          WHERE d2.word = d.word
-        )
-        WHERE d.relations IS NULL
-          AND d.id IN (${placeholders})
-      `;
+      let batchUpdated = 0;
+      let batchInserted = 0;
 
-      const updateResult = await client.query(updateQuery, ids);
-      const batchUpdated = updateResult.rowCount;
+      // Process each row: update meaning if word exists, insert new row if it doesn't
+      for (const row of result.rows) {
+        // Check if word already exists in dictionary
+        const checkQuery = `SELECT id FROM dictionary WHERE word = $1 LIMIT 1`;
+        const checkResult = await client.query(checkQuery, [row.word]);
+        
+        if (checkResult.rows.length > 0) {
+          // Word exists - update the meaning and relations columns
+          const updateQuery = `
+            UPDATE dictionary
+            SET meaning = $1, relations = $2
+            WHERE word = $3
+          `;
+          await client.query(updateQuery, [row.meaning, row.relations || null, row.word]);
+          batchUpdated++;
+        } else {
+          // Word doesn't exist - insert new row with all required columns
+          const insertQuery = `
+            INSERT INTO dictionary (id, word, meaning, created_at, source, language, relations)
+            VALUES (
+              gen_random_uuid(),
+              $1,
+              $2,
+              NOW(),
+              'wiktionary',
+              'english',
+              $3
+            )
+          `;
+          await client.query(insertQuery, [
+            row.word,
+            row.meaning,
+            row.relations || null
+          ]);
+          batchInserted++;
+        }
+      }
 
       totalUpdated += batchUpdated;
-      console.log(`  Updated ${batchUpdated} rows in this batch`);
-      console.log(`  Total updated so far: ${totalUpdated}`);
+      totalInserted += batchInserted;
 
-      // Update lastId to the maximum ID from this batch for next iteration
-      // For UUIDs, we need to sort as strings and take the last one
-      if (ids.length > 0) {
-        // Sort UUIDs as strings and take the last (maximum) one
-        const sortedIds = [...ids].sort();
-        lastId = sortedIds[sortedIds.length - 1];
+      logger.log(`  Updated ${batchUpdated} rows in this batch`);
+      logger.log(`  Inserted ${batchInserted} rows in this batch`);
+      logger.log(`  Total updated so far: ${totalUpdated}`);
+      console.log(`  Total updated so far: ${totalUpdated}`);
+      logger.log(`  Total inserted so far: ${totalInserted}`);
+      console.log(`  Total inserted so far: ${totalInserted}`);
+
+      // Update lastId for next iteration - use the last ID from dictionary_v2
+      if (result.rows.length > 0) {
+        lastId = result.rows[result.rows.length - 1].id;
         await saveLastId(lastId);
-        console.log(`  LastId saved: ${lastId}`);
+        logger.log(`  LastId saved: ${lastId}`);
       } else {
         break;
       }
@@ -116,24 +203,27 @@ async function batchUpdate() {
       await new Promise(resolve => setTimeout(resolve, 100));
     }
 
-    console.log(`\n=== Final Summary ===`);
-    console.log(`Total rows updated: ${totalUpdated}`);
-    console.log(`Total batches processed: ${batchNumber - 1}`);
+    logger.log('=== Final Summary ===');
+    logger.log(`Total rows updated: ${totalUpdated}`);
+    logger.log(`Total rows inserted: ${totalInserted}`);
+    logger.log(`Total rows processed: ${totalUpdated + totalInserted}`);
+    logger.log(`Total batches processed: ${batchNumber - 1}`);
     
     // Clear lastId file when complete
     try {
       await fs.unlink(LAST_ID_FILE);
-      console.log('LastId file cleared (process complete)');
+      logger.log('LastId file cleared (process complete)');
     } catch (error) {
       // File might not exist, ignore
     }
 
   } catch (error) {
-    console.error('Error:', error);
-    console.log(`\nProgress saved. Resume from lastId: ${lastId}`);
+    logger.error('Error occurred', error);
+    logger.log(`Progress saved. Resume from lastId: ${lastId}`);
   } finally {
     await client.end();
-    console.log('\nDatabase connection closed');
+    logger.log('Database connection closed');
+    logger.close();
   }
 }
 
